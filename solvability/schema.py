@@ -40,7 +40,7 @@ CANONICAL_COLS = ID_COLS + [c for c in INPUT_FIELDS if c not in ID_COLS] + OUTCO
 # --------------------------------------------------------------------------- #
 ITEM_CATEGORIES = [
     "vehicle", "vehicle_parts_contents", "bicycle", "electronics", "cash_cards",
-    "jewelry_precious", "tools_equipment", "retail_merchandise", "personal_items",
+    "jewelry_precious", "firearms", "tools_equipment", "retail_merchandise", "personal_items",
     "household", "other", "unknown",
 ]
 LOCATION_TYPES = [
@@ -77,9 +77,13 @@ STANDING_CAVEATS = [
 ]
 
 SOURCE_CAVEATS = {
-    "nibrs": "NIBRS: arrest and exceptional-clearance dates are recorded. Follow-up ends "
-             "at the file snapshot, so later clearances are right-censored. Many agencies "
-             "flag the date as the REPORT date when the occurrence date is unknown.",
+    "nibrs": "FBI NIBRS: arrest and exceptional-clearance dates are recorded. Each annual "
+             "file includes updates until about the following March. Later clearances are "
+             "right-censored, so the 365-day figure rests on cases reported early in the "
+             "year. NIBRS has no report-delay field. Offender details are excluded because "
+             "they are mostly filled in after an arrest. The insider (employee/employer) "
+             "flag is recorded for only a minority of property cases and may also be added "
+             "once a suspect is identified.",
     "chicago": "Chicago portal: records only whether an arrest was made, not when, and "
                "has no exceptional clearances or loss values (only $500 bands). Used for "
                "the long-run horizon only.",

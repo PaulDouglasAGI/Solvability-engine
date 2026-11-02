@@ -124,7 +124,7 @@ def test_nibrs_loader(tmp_path):
     a = df.loc["nibrs:10"]
     assert a.cleared == 1 and a.clearance_type == "arrest" and a.duration_days == 2    # first arrest
     assert a.loss_value == 1300 and a.item_category == "electronics"                   # top-value item
-    assert a.location_type == "residence" and a.offender_count == 2 and a.timing_known
+    assert a.location_type == "residence" and np.isnan(a.offender_count) and a.timing_known
     b = df.loc["nibrs:11"]
     assert b.cleared == 0 and b.item_category == "vehicle" and b.duration_days == b.followup_days
     c = df.loc["nibrs:12"]

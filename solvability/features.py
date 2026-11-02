@@ -17,8 +17,8 @@ CATS = ["item_category", "location_type", "victim_type", "jurisdiction"]
 
 @dataclass
 class FeatureBuilder:
-    min_jurisdiction_count: int = 200
-    max_jurisdictions: int = 40
+    min_jurisdiction_count: int = 300
+    max_jurisdictions: int = 60
 
     medians_: dict = field(default_factory=dict)
     levels_: dict = field(default_factory=dict)
@@ -96,6 +96,11 @@ class FeatureBuilder:
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         X = self._transform(df)
         return X.reindex(columns=self.columns_, fill_value=0.0).to_numpy(dtype=float)
+
+    def collapse_jurisdiction(self, s: pd.Series) -> np.ndarray:
+        """Jurisdictions too small to model separately are pooled as 'other'."""
+        s = s.astype(str).to_numpy()
+        return np.where(np.isin(s, self.levels_["jurisdiction"]), s, "other")
 
     def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
         return self.fit(df).transform(df)

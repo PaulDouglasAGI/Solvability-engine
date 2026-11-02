@@ -139,7 +139,10 @@ def clean(df: pd.DataFrame, *, report: dict | None = None) -> pd.DataFrame:
 def horizon_labels(df: pd.DataFrame, horizon: float, long_run_horizon: float) -> pd.Series:
     """Cleared-by-`horizon` label per row; NaN where the data cannot say.
 
-    Rows with known timing are labelled directly (censored before the horizon -> NaN).
+    Rows with known timing are labelled only if they were followed for the whole horizon
+    (or cleared within it AND were followed that long). Counting quick clearances from
+    cases followed for less than the horizon, while dropping their uncleared
+    neighbours, would inflate the rate.
     Rows where the source records only *whether* a case cleared (timing unknown) can only
     be labelled at the long-run horizon, and only if we watched them at least that long.
     Labelling them at shorter horizons would quietly turn late clearances into "not
@@ -149,9 +152,8 @@ def horizon_labels(df: pd.DataFrame, horizon: float, long_run_horizon: float) ->
     tk = df["timing_known"].astype(bool)
     ev, dur, fu = df["cleared"], df["duration_days"], df["followup_days"]
 
-    y[tk & (ev == 1) & (dur <= horizon)] = 1.0
-    y[tk & (dur > horizon)] = 0.0
-    y[tk & (ev == 0) & (dur >= horizon)] = 0.0
+    full = tk & (fu >= horizon)
+    y[full] = ((ev == 1) & (dur <= horizon))[full].astype(float)
 
     if horizon >= long_run_horizon:
         m = ~tk & (fu >= long_run_horizon)

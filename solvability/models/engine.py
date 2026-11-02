@@ -16,6 +16,7 @@ from sklearn.linear_model import LogisticRegression
 from ..cleaning import horizon_labels
 from ..features import FeatureBuilder
 from ..schema import FLAG_FIELDS, DEFAULT_HORIZONS, SOURCE_CAVEATS, STANDING_CAVEATS
+from ..evidence import compact_reference, similar_cases
 from .cox import CoxPH
 
 MIN_POSITIVES = 30
@@ -68,11 +69,15 @@ class Calibrator:
 
     def transform(self, p):
         p = np.asarray(p, float)
+        out = p.copy()
+        ok = ~np.isnan(p)
+        if not ok.any() or self.method == "identity":
+            return out
         if self.method == "isotonic":
-            return self.model.predict(p)
-        if self.method == "platt":
-            return self.model.predict_proba(self._logit(p)[:, None])[:, 1]
-        return p
+            out[ok] = self.model.predict(p[ok])
+        else:
+            out[ok] = self.model.predict_proba(self._logit(p[ok])[:, None])[:, 1]
+        return out
 
 
 def _monotone(P: np.ndarray) -> np.ndarray:
@@ -91,7 +96,7 @@ def _monotone(P: np.ndarray) -> np.ndarray:
 @dataclass
 class SolvabilityEngine:
     horizons: tuple = DEFAULT_HORIZONS
-    headline: str = "blend"               # "blend" (mean of the two) | "gbm" | "cox"
+    headline: str = "auto"                # "auto" (best on calibration data, per horizon) | "blend" | "gbm" | "cox"
     cox_penalizer: float = 0.1
     stratify_cox: bool = True
     random_state: int = 0
@@ -102,6 +107,9 @@ class SolvabilityEngine:
     cal_cox: dict = field(default_factory=dict)
     cal_gbm: dict = field(default_factory=dict)
     meta: dict = field(default_factory=dict)
+    reference_cases: pd.DataFrame | None = None
+    headline_choice_: dict = field(default_factory=dict)
+    untimed_jurisdictions_: set = field(default_factory=set)
 
     @property
     def long_run(self) -> float:
@@ -112,10 +120,16 @@ class SolvabilityEngine:
         Xtr = self.builder.fit_transform(train)
         Xca = self.builder.transform(calib)
 
-        # Cox on rows whose clearance timing is known
+        # Jurisdictions whose records never carry clearance dates can't be given
+        # short-horizon estimates: their agencies' timing is simply unknown.
         tk = train["timing_known"].to_numpy(bool)
+        jur = pd.Series(self.builder.collapse_jurisdiction(train["jurisdiction"]))
+        timed = jur[tk].unique()
+        self.untimed_jurisdictions_ = set(jur.unique()) - set(timed)
+
+        # Cox on rows whose clearance timing is known
         if tk.sum() and train.loc[tk, "cleared"].sum() >= MIN_COX_EVENTS:
-            strata = train.loc[tk, "jurisdiction"].to_numpy() if self.stratify_cox else None
+            strata = self.builder.collapse_jurisdiction(train.loc[tk, "jurisdiction"]) if self.stratify_cox else None
             self.cox = CoxPH(penalizer=self.cox_penalizer).fit(
                 Xtr[tk], train.loc[tk, "duration_days"].to_numpy(), train.loc[tk, "cleared"].to_numpy(), strata)
         else:
@@ -145,10 +159,29 @@ class SolvabilityEngine:
             y = horizon_labels(calib, h, self.long_run)
             m = y.notna().to_numpy()
             if raw_cox is not None:
-                self.cal_cox[h] = Calibrator().fit(raw_cox[m, j], y[m])
+                mc = m & ~np.isnan(raw_cox[:, j])
+                self.cal_cox[h] = Calibrator().fit(raw_cox[mc, j], y[mc])
             if h in self.gbms:
                 self.cal_gbm[h] = Calibrator().fit(raw_gbm[m, j], y[m])
 
+        # Pick the headline per horizon: whichever of GBM / Cox / their mean has the
+        # lowest Brier score on the calibration rows
+        self.headline_choice_ = {}
+        if self.headline == "auto":
+            P = self.predict_all(calib, combine=False)
+            for j, h in enumerate(self.horizons):
+                y = horizon_labels(calib, h, self.long_run).to_numpy()
+                scores = {}
+                for name in ("gbm", "cox", "blend"):
+                    if name not in P:
+                        continue
+                    p = P[name][:, j]
+                    ok = ~np.isnan(y) & ~np.isnan(p)
+                    if ok.sum() >= 100:
+                        scores[name] = float(np.mean((p[ok] - y[ok]) ** 2))
+                self.headline_choice_[h] = min(scores, key=scores.get) if scores else "gbm"
+
+        self.reference_cases = compact_reference(pd.concat([train, calib], ignore_index=True))
         self.meta = {
             "n_train": int(len(train)), "n_calib": int(len(calib)),
             "sources": sorted(set(train["source"].astype(str))),
@@ -158,6 +191,8 @@ class SolvabilityEngine:
             "timing_known_share": float(train["timing_known"].mean()),
             "gbm_horizons": sorted(self.gbms),
             "cox_fitted": self.cox is not None,
+            "headline_by_horizon": dict(self.headline_choice_),
+            "jurisdictions_without_clearance_dates": sorted(self.untimed_jurisdictions_),
             "calibration": {"cox": {h: c.method for h, c in self.cal_cox.items()},
                             "gbm": {h: c.method for h, c in self.cal_gbm.items()}},
         }
@@ -167,10 +202,16 @@ class SolvabilityEngine:
     def _strata(self, df):
         if self.cox is None or not self.stratify_cox:
             return None
-        return df["jurisdiction"].astype(str).to_numpy()
+        return self.builder.collapse_jurisdiction(df["jurisdiction"])
 
     def _raw_cox(self, X, df) -> np.ndarray:
-        return self.cox.predict_cdf(X, self.horizons, self._strata(df))
+        strata = self._strata(df)
+        out = self.cox.predict_cdf(X, self.horizons, strata)
+        if self.untimed_jurisdictions_:
+            # no Cox estimate for agencies whose records carry no clearance dates
+            jur = self.builder.collapse_jurisdiction(df["jurisdiction"])
+            out[np.isin(jur, list(self.untimed_jurisdictions_))] = np.nan
+        return out
 
     def _raw_gbm(self, X) -> np.ndarray:
         out = np.full((X.shape[0], len(self.horizons)), np.nan)
@@ -180,7 +221,7 @@ class SolvabilityEngine:
         return out
 
     # ----------------------------------------------------------- predict
-    def predict_all(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+    def predict_all(self, df: pd.DataFrame, combine: bool = True) -> dict[str, np.ndarray]:
         """Raw and calibrated P(cleared by h) from each model -> arrays (n, n_horizons)."""
         X = self.builder.transform(df)
         n, H = X.shape[0], len(self.horizons)
@@ -189,20 +230,39 @@ class SolvabilityEngine:
             rc = self._raw_cox(X, df)
             cc = np.column_stack([self.cal_cox[h].transform(rc[:, j]) if h in self.cal_cox else rc[:, j]
                                   for j, h in enumerate(self.horizons)])
+            cc[np.isnan(rc)] = np.nan
             out["cox_raw"], out["cox"] = rc, _monotone(cc)
         rg = self._raw_gbm(X)
         cg = np.column_stack([self.cal_gbm[h].transform(rg[:, j]) if h in self.cal_gbm else rg[:, j]
                               for j, h in enumerate(self.horizons)])
         out["gbm_raw"] = rg
+        # Agencies without clearance dates: only the long-run horizon is supported. Blank
+        # the rest BEFORE enforcing monotonicity, or the unsupported short-horizon values
+        # would drag the long-run estimate up.
+        if self.untimed_jurisdictions_:
+            untimed = np.isin(self.builder.collapse_jurisdiction(df["jurisdiction"]),
+                              list(self.untimed_jurisdictions_))
+            cg[np.ix_(untimed, np.arange(H - 1))] = np.nan
         # fill horizons GBM couldn't learn from the calibrated Cox curve
         if "cox" in out:
             cg = np.where(np.isnan(cg), out["cox"], cg)
         out["gbm"] = _monotone(cg)
+        if "cox" in out:
+            both = 0.5 * (out["cox"] + out["gbm"])
+            out["blend"] = _monotone(np.where(np.isnan(both), out["gbm"], both))
 
-        if self.headline == "cox" and "cox" in out:
-            out["headline"] = out["cox"]
-        elif self.headline == "blend" and "cox" in out:
-            out["headline"] = _monotone(0.5 * (out["cox"] + out["gbm"]))
+        if not combine:
+            return out
+
+        mode = self.headline
+        if mode == "auto" and self.headline_choice_:
+            cols = []
+            for j, h in enumerate(self.horizons):
+                pick = out.get(self.headline_choice_.get(h, "gbm"), out["gbm"])[:, j]
+                cols.append(np.where(np.isnan(pick), out["gbm"][:, j], pick))
+            out["headline"] = _monotone(np.column_stack(cols))
+        elif mode in ("cox", "blend") and mode in out:
+            out["headline"] = np.where(np.isnan(out[mode]), out["gbm"], out[mode])
         else:
             out["headline"] = out["gbm"] if not np.isnan(out["gbm"]).all() else out.get("cox", out["gbm"])
         return out
@@ -301,6 +361,29 @@ class SolvabilityEngine:
     def _default_horizon(self):
         av = self.available_horizons
         return 90 if 90 in av else av[-1]
+
+    # ----------------------------------------------------------- evidence
+    def similar(self, case: pd.DataFrame, asked_fields) -> dict | None:
+        """Outcomes of real training cases that match the answers given."""
+        if self.reference_cases is None:
+            return None
+        return similar_cases(self.reference_cases, case, set(asked_fields), self.horizons, self.long_run)
+
+    def askable_fields(self) -> list[str]:
+        """Inputs the training data actually recorded, so the model can use them."""
+        b = self.builder
+        out = []
+        for f in ["item_category", "location_type", "loss_value", "days_to_report", "victim_type",
+                  "jurisdiction", "has_footage", "has_witness", "has_plate_read", "insider"]:
+            if f in b.flag_observed_:
+                ok = b.flag_observed_[f]
+            elif f in b.levels_:
+                ok = len([lv for lv in b.levels_[f] if lv not in ("unknown", "other")]) >= 2
+            else:
+                ok = b.missing_rate_.get(f, 1.0) < 0.95
+            if ok:
+                out.append(f)
+        return out
 
     # ------------------------------------------------------------ caveats
     def caveats(self) -> list[str]:

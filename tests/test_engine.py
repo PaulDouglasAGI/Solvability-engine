@@ -116,8 +116,54 @@ def test_cli_end_to_end(tmp_path, capsys):
     main(["train", "--data", f"synthetic={csv}", "--out", str(model), "--plot", str(tmp_path / "c.png")])
     main(["predict", "--model", str(model), "--set", "item=bicycle", "value=900", "footage=yes"])
     out = capsys.readouterr().out
-    assert "P(case cleared within" in out and "Top factors" in out and "SYNTHETIC" in out
+    assert "P(case cleared within" in out and "What moves the estimate" in out and "Similar real cases" in out and "SYNTHETIC" in out
     assert "Only REPORTED thefts" in out
     main(["whatif", "--model", str(model), "--set", "item=bicycle", "--sweep", "report_delay=0,7,30"])
     main(["wait", "--model", str(model), "--set", "item=bicycle", "--json"])
     assert '"diminishing_returns_day"' in capsys.readouterr().out
+
+
+def test_kaplan_meier_handles_censoring():
+    from solvability.evidence import kaplan_meier
+    # 4 cases: cleared day 1, censored day 2, cleared day 3, censored day 5 (x10 so the tail is reportable)
+    d = np.tile([1, 2, 3, 5], 10)
+    e = np.tile([1, 0, 1, 0], 10)
+    F = kaplan_meier(d, e, [1, 3])
+    np.testing.assert_allclose(F, [0.25, 1 - 0.75 * 0.5])
+
+
+def test_similar_cases_match_and_relax(engine):
+    case = wi.make_case({"item": "bicycle", "location": "street_parking", "value": 600}, engine)
+    sim = engine.similar(case, {"item_category", "location_type", "loss_value"})
+    ref = engine.reference_cases
+    assert sim["n"] >= 100
+    if not sim["relaxed"]:
+        m = (ref.item_category == "bicycle") & (ref.location_type == "street_parking") & ref.loss_value.between(300, 1200)
+        assert sim["n"] == int(m.sum())
+    # an impossible combination forces relaxation rather than an empty answer
+    rare = wi.make_case({"item": "jewelry_precious", "location": "transit", "value": 90000,
+                         "report_delay": 40, "victim": "government_institution"}, engine)
+    sim2 = engine.similar(rare, {"item_category", "location_type", "loss_value", "days_to_report", "victim_type"})
+    assert sim2["relaxed"] and sim2["n"] >= 100
+
+
+def test_ask_only_asks_learned_questions(tmp_path, capsys):
+    from solvability.cli import cmd_ask
+    import argparse
+    csv, model = tmp_path / "s.csv", tmp_path / "m.pkl"
+    df = generate(4000, seed=3)
+    df["has_plate_read"] = np.nan                       # never recorded -> must not be asked
+    df.to_csv(csv, index=False)
+    main(["train", "--data", f"synthetic={csv}", "--out", str(model), "--plot", str(tmp_path / "c.png")])
+    capsys.readouterr()
+    prompts = []
+
+    def fake_input(p):
+        prompts.append(p)
+        return {0: "1", 1: "1", 2: "500"}.get(len(prompts) - 1, "")
+
+    cmd_ask(argparse.Namespace(model=str(model), top=3, plot=str(tmp_path / "case.png")), inp=fake_input)
+    out = capsys.readouterr().out
+    assert "licence plate" not in " ".join(prompts).lower()
+    assert "Not asked" in out and "Similar real cases" in out
+    assert (tmp_path / "case.png").exists()

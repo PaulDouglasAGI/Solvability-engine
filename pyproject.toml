@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "statsmodels>=0.14"]
 
 [project.scripts]
 solvability = "solvability.cli:main"

@@ -24,9 +24,9 @@ import pandas as pd
 
 from . import whatif as wi
 from .cleaning import NewsSourceError, assert_no_news, clean, find_news_rows
-from .data.loader import PORTALS, fetch_portal, load_many
+from .data.loader import PORTALS, fetch_nibrs, fetch_portal, load_many
 from .data.synthetic import generate
-from .evaluation import calibration_plot, evaluate
+from .evaluation import calibration_plot, case_plot, evaluate
 from .models.engine import SolvabilityEngine, split
 from .schema import DEFAULT_HORIZONS
 
@@ -108,6 +108,18 @@ def cmd_synth(args):
 
 
 def cmd_fetch(args):
+    if args.portal == "nibrs":
+        if not args.state or not args.years:
+            raise SystemExit("fetch nibrs needs --state XX [YY ...] and --years YYYY [YYYY ...]")
+        for st in args.state:
+            for y in args.years:
+                try:
+                    print(f"wrote {fetch_nibrs(st, y, args.out)}")
+                except FileNotFoundError as e:
+                    print(f"skipped: {e}")
+        return
+    if not args.since:
+        raise SystemExit("portal downloads need --since YYYY-MM-DD")
     p = fetch_portal(args.portal, args.out, since=args.since, until=args.until, limit=args.limit)
     print(f"wrote {p}")
 
@@ -193,21 +205,88 @@ def cmd_evaluate(args):
 
 def _prediction_payload(engine, fields, horizon=None, top=5):
     case = wi.make_case(fields, engine)
-    allp = engine.predict_all(case)
+    pred = wi.predict_fields(engine, fields)
     horizon = horizon or engine._default_horizon()
+
+    def _d(arr):
+        return {str(h): (None if np.isnan(arr[j]) else float(arr[j])) for j, h in enumerate(engine.horizons)}
+
     return {
         "inputs": {k: (None if v is None or (isinstance(v, float) and np.isnan(v)) else v) for k, v in fields.items()},
         "horizons_days": list(engine.horizons),
-        "p_cleared": {str(h): float(allp["headline"][0, j]) for j, h in enumerate(engine.horizons)},
-        "p_cleared_cox": ({str(h): float(allp["cox"][0, j]) for j, h in enumerate(engine.horizons)}
-                          if "cox" in allp else None),
+        "p_cleared": _d(pred["headline"]),
+        "p_cleared_cox": _d(pred["cox"]) if "cox" in pred else None,
+        "averaged_over_real_cases": pred["n_population"],
         "headline_model": engine.headline,
         "factor_horizon_days": horizon,
-        "top_factors": engine.explain(case, horizon=horizon, top=top),
+        "top_factors": wi.explain_fields(engine, fields, horizon=horizon, top=top),
         "warnings": wi.check_case(engine, case, fields),
+        "similar_real_cases": engine.similar(case, fields.keys()),
         "synthetic_model": engine.is_synthetic,
         "caveats": engine.caveats(),
     }
+
+
+def _case_phrase(k, v):
+    if k == "loss_value":
+        return f"${v:,.0f}"
+    if k == "days_to_report":
+        return f"reported after {v:g} days"
+    if k == "jurisdiction":
+        parts = str(v).split(" ", 1)
+        if len(parts) == 2 and len(parts[0]) == 2:
+            return f"{parts[1].title()} ({parts[0].upper()})"
+        return str(v).replace("_", " ").title()
+    if k in ("has_footage", "has_witness", "has_plate_read", "insider"):
+        return f"{wi.FIELD_LABELS[k]}: {wi._show(k, v)}"
+    return str(v).replace("_", " ")
+
+
+def _render_prediction(engine, fields, pay, plot=None):
+    print("Case: " + (", ".join(f"{k}={v}" for k, v in fields.items()) or "(all unknown)"))
+    sim = pay.get("similar_real_cases")
+    obs = (sim or {}).get("observed_by_horizon", {})
+    print("\nP(case cleared within ...)")
+    if not engine.has_timing:
+        print(_wrap("(Only the long-run horizon is available: the training sources don't record "
+                    "WHEN cases cleared.)"))
+    head = f"  {'':>9}  {'model':>6}"
+    if sim and sim["n"]:
+        head += f"   {'similar real cases':>18}"
+    print(head)
+    for h in engine.horizons:
+        line = f"  {h:>4} days  {_pct(pay['p_cleared'][str(h)])}"
+        if sim and sim["n"]:
+            o = obs.get(int(h))
+            if o is None and h == engine.long_run:
+                o = sim.get("observed_long_run")
+            line += f"   {_pct(o):>18}"
+        print(line)
+    if sim and sim["n"]:
+        src = ", ".join(f"{k} {v:,}" for k, v in sim["sources"].items())
+        yrs = f"{sim['years'][0]}–{sim['years'][1]}" if sim["years"] else ""
+        print(_wrap(f"Similar real cases: {sim['n']:,} reported thefts ({src}; {yrs}) matching "
+                    + ("; ".join(sim["criteria"]) or "nothing specific (all cases)") + "."))
+        if sim["relaxed"]:
+            print(_wrap("Too few exact matches, so these were not required to match: "
+                        + ", ".join(r.replace("_", " ") for r in sim["relaxed"]) + "."))
+        if sim["median_days_to_clear"] is not None:
+            print(_wrap(f"Among those that were cleared, the median time to clearance was "
+                        f"{sim['median_days_to_clear']:.0f} days."))
+    print(f"\nWhat moves the estimate at {pay['factor_horizon_days']} days (each answer vs. not knowing it):")
+    for f in pay["top_factors"]:
+        print(f"  {f['delta_pp']:+6.1f} pts  {f['label']}: {f['value']}")
+    if not pay["top_factors"]:
+        print("  (no answers given: this is the average over all real cases)")
+    print(_wrap(f"Unanswered questions are averaged over {pay['averaged_over_real_cases']} real "
+                "cases that match the answers given.", ""))
+    for w in pay["warnings"]:
+        print(_wrap("! " + w, ""))
+    if plot:
+        sub = ", ".join(_case_phrase(k, v) for k, v in fields.items())
+        case_plot(engine, wi.population(engine, fields), sim, plot, subtitle=sub or None)
+        print(f"\nchart -> {plot}")
+    _print_caveats(engine)
 
 
 def cmd_predict(args):
@@ -217,25 +296,76 @@ def cmd_predict(args):
     if args.json:
         print(json.dumps(pay, indent=2, default=str))
         return
-    print("Case: " + (", ".join(f"{k}={v}" for k, v in fields.items()) or "(all unknown)"))
-    print("\nP(case cleared within ...)")
-    if not engine.has_timing:
-        print(_wrap("(Only the long-run horizon is available: the training sources don't record "
-                    "WHEN cases cleared.)"))
-    for h in engine.horizons:
-        line = f"  {h:>4} days  {_pct(pay['p_cleared'][str(h)])}"
-        if pay["p_cleared_cox"]:
-            line += f"     (Cox survival model: {_pct(pay['p_cleared_cox'][str(h)])})"
-        print(line)
-    print(f"\nTop factors at {pay['factor_horizon_days']} days, compared with a typical reported case:")
-    for f in pay["top_factors"]:
-        hm = f" | hazard x{f['hazard_multiplier']:.2f}" if f["hazard_multiplier"] is not None else ""
-        print(f"  {f['delta_pp']:+6.1f} pts  {f['label']}: {f['value']} (typical: {f['typical']}){hm}")
-    if not pay["top_factors"]:
-        print("  (this case matches the typical case on every field)")
-    for w in pay["warnings"]:
-        print(_wrap("! " + w, ""))
-    _print_caveats(engine)
+    _render_prediction(engine, fields, pay, args.plot)
+
+
+QUESTIONS = {
+    "item_category": "What was stolen?",
+    "location_type": "Where was it taken from?",
+    "loss_value": "Roughly what was it worth, in dollars?",
+    "days_to_report": "How many days after the theft was it reported? (0 = same day)",
+    "victim_type": "Who was the victim?",
+    "jurisdiction": "Which police agency? (type part of the name)",
+    "has_footage": "Was there video footage?",
+    "has_witness": "Were there witnesses?",
+    "has_plate_read": "Was a licence plate captured?",
+    "insider": "Is an employee or employer suspected?",
+}
+
+
+def _ask_one(engine, f, inp, out):
+    ref = engine.reference_cases
+    q = QUESTIONS[f]
+    if f in ("item_category", "location_type", "victim_type"):
+        levels = [lv for lv in engine.builder.levels_[f] if lv not in ("unknown",)]
+        counts = ref[f].astype(str).value_counts() if ref is not None else pd.Series(dtype=int)
+        levels.sort(key=lambda lv: (lv == "other", -counts.get(lv, 0)))
+        print(f"\n{q}", file=out)
+        for i, lv in enumerate(levels, 1):
+            print(f"  {i:>2}) {lv.replace('_', ' '):<26} {counts.get(lv, 0):>9,} real cases", file=out)
+        a = inp("  choose a number (Enter = don't know): ").strip()
+        if a.isdigit() and 1 <= int(a) <= len(levels):
+            return levels[int(a) - 1]
+        return None
+    if f == "jurisdiction":
+        levels = [lv for lv in engine.builder.levels_[f] if lv != "other"]
+        a = inp(f"\n{q} Enter = skip: ").strip().lower()
+        if not a:
+            return None
+        hits = [lv for lv in levels if a in lv]
+        if not hits:
+            print("  no modelled agency matches; using the pooled average", file=out)
+            return None
+        for i, lv in enumerate(hits[:12], 1):
+            print(f"  {i:>2}) {lv}", file=out)
+        b = inp("  choose a number: ").strip()
+        return hits[int(b) - 1] if b.isdigit() and 1 <= int(b) <= len(hits[:12]) else None
+    if f in ("loss_value", "days_to_report"):
+        a = inp(f"\n{q} (Enter = don't know): ").strip()
+        v = _parse_value(a) if a else None
+        return v if isinstance(v, float) else None
+    a = inp(f"\n{q} [y/n, Enter = don't know]: ").strip().lower()
+    return 1 if a.startswith("y") else 0 if a.startswith("n") else None
+
+
+def cmd_ask(args, inp=input, out=None):
+    out = out or sys.stdout
+    engine = _load_engine(args.model)
+    fields_ok = engine.askable_fields()
+    skipped = [QUESTIONS[f] for f in QUESTIONS if f not in fields_ok]
+    print("Answer a few questions about a reported theft. Every question is about something "
+          "the real data records, so the answer is based on actual cases.", file=out)
+    if skipped:
+        print(_wrap("Not asked, because the training data doesn't record it: "
+                    + "; ".join(s.split("?")[0].lower() for s in skipped) + "."), file=out)
+    fields = {}
+    for f in fields_ok:
+        v = _ask_one(engine, f, inp, out)
+        if v is not None:
+            fields[f] = v
+    print("", file=out)
+    pay = _prediction_payload(engine, fields, None, args.top)
+    _render_prediction(engine, fields, pay, args.plot)
 
 
 def _parse_scenarios(items) -> dict:
@@ -334,9 +464,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="data/synth.csv")
     s.set_defaults(fn=cmd_synth)
 
-    s = sub.add_parser("fetch", help="download theft records from an open-data portal")
-    s.add_argument("portal", choices=sorted(PORTALS))
-    s.add_argument("--since", required=True, help="YYYY-MM-DD")
+    s = sub.add_parser("fetch", help="download real theft records (FBI NIBRS or city portals)")
+    s.add_argument("portal", choices=sorted(PORTALS) + ["nibrs"])
+    s.add_argument("--state", nargs="*", help="nibrs: state abbreviations, e.g. CO VA")
+    s.add_argument("--years", nargs="*", type=int, help="nibrs: data years, e.g. 2023 2024")
+    s.add_argument("--since", help="portals: YYYY-MM-DD")
     s.add_argument("--until")
     s.add_argument("--limit", type=int, default=100000)
     s.add_argument("--out", required=True)
@@ -349,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--as-of", help="date follow-up ends (default: latest date in the data)")
     s.add_argument("--split", choices=["random", "temporal"], default="random")
     s.add_argument("--horizons", help="comma list of days, default 1,7,30,90,365")
-    s.add_argument("--headline", choices=["blend", "gbm", "cox"], default="blend")
+    s.add_argument("--headline", choices=["auto", "blend", "gbm", "cox"], default="auto")
     s.add_argument("--no-strata", action="store_true", help="don't stratify Cox baseline by jurisdiction")
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--out", default="artifacts/model.pkl")
@@ -376,6 +508,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--horizon", type=int, help="horizon for factor attribution (default 90)")
     s.add_argument("--top", type=int, default=5)
     s.set_defaults(fn=cmd_predict)
+
+    s.add_argument("--plot", help="save a chart of the case (PNG) for slides")
+
+    s = sub.add_parser("ask", help="interactive: answer questions about a theft, get the odds")
+    s.add_argument("--model", required=True)
+    s.add_argument("--top", type=int, default=5)
+    s.add_argument("--plot", help="save a chart of the case (PNG) for slides")
+    s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("whatif", help="compare hypothetical variants of a case")
     case_args(s)

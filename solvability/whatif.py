@@ -106,11 +106,103 @@ def check_case(engine: SolvabilityEngine, case: pd.DataFrame, asked: dict | None
 # Scenarios
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# "Don't know" = average over real cases
+# --------------------------------------------------------------------------- #
+POP_SIZE = 400
+_MATCH_CATS = ["item_category", "location_type", "victim_type", "jurisdiction"]
+
+
+def population(engine: SolvabilityEngine, fields: dict, k: int = POP_SIZE, seed: int = 0) -> pd.DataFrame:
+    """Real training cases standing in for whatever wasn't answered.
+
+    Draws up to `k` real cases that match the categorical answers (falling back to all
+    cases if too few match), then overwrites them with every answer given. Averaging
+    predictions over this sample means a skipped question counts as "don't know",
+    not as the rare recorded category "unknown".
+    """
+    f = normalise_fields(fields)
+    ref = engine.reference_cases
+    if ref is None:                       # older model files: single hypothetical row
+        return make_case(f, engine)
+    case = make_case(f, engine)           # cleaned / validated answers
+    pool = ref
+    juris = case.iloc[0]["jurisdiction"] if "jurisdiction" in f else None
+    if engine.has_timing and (juris is None or juris not in engine.untimed_jurisdictions_):
+        pool = pool[pool["timing_known"].to_numpy(bool)]   # agencies with a time curve
+    m = np.ones(len(pool), bool)
+    for c in _MATCH_CATS:
+        if c in f:
+            m &= (pool[c].astype(str) == str(case.iloc[0][c])).to_numpy()
+    if m.sum() >= 50:
+        pool = pool[m]
+    sample = pool.sample(min(k, len(pool)), random_state=seed).copy()
+    for c in sample.columns:
+        if isinstance(sample[c].dtype, pd.CategoricalDtype):
+            sample[c] = sample[c].astype(object)
+    for c in f:
+        sample[c] = case.iloc[0][c]
+    for c in FLAG_FIELDS:                 # flags the model never learned stay out entirely
+        if not engine.builder.flag_observed_.get(c, False):
+            sample[c] = np.nan
+    for c in CANONICAL_COLS:
+        if c not in sample.columns:
+            sample[c] = np.nan
+    return sample.reset_index(drop=True)
+
+
+def predict_fields(engine: SolvabilityEngine, fields: dict) -> dict:
+    """Mean P(cleared by h) over the population for these answers."""
+    pop = population(engine, fields)
+    allp = engine.predict_all(pop)
+    out = {"headline": _nanmean(allp["headline"])}
+    if "cox" in allp:
+        out["cox"] = _nanmean(allp["cox"])
+    out["n_population"] = len(pop)
+    return out
+
+
+def _nanmean(P):
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return np.nanmean(P, axis=0)
+
+
+def explain_fields(engine: SolvabilityEngine, fields: dict, horizon=None, top: int = 6) -> list[dict]:
+    """For each answer: how far it moves the estimate compared with not knowing it."""
+    f = normalise_fields(fields)
+    horizon = horizon or engine._default_horizon()
+    j = list(engine.horizons).index(horizon)
+    base = predict_fields(engine, f)["headline"][j]
+    rows = []
+    for k, v in f.items():
+        if v is None:
+            continue
+        without = {kk: vv for kk, vv in f.items() if kk != k}
+        p = predict_fields(engine, without)["headline"][j]
+        if np.isnan(base) or np.isnan(p):
+            continue
+        rows.append({"field": k, "label": FIELD_LABELS.get(k, k), "value": _show(k, v),
+                     "delta_pp": 100.0 * (base - p)})
+    rows.sort(key=lambda r: -abs(r["delta_pp"]))
+    return rows[:top]
+
+
+def _show(field, v):
+    if field in FLAG_FIELDS:
+        return "yes" if v in (1, 1.0, True) else "no" if v in (0, 0.0, False) else str(v)
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
 def compare(engine: SolvabilityEngine, base_fields: dict, scenarios: dict[str, dict]) -> pd.DataFrame:
     """Each scenario = base fields with some overrides. Returns P(cleared by h) per scenario."""
     names = ["as given"] + list(scenarios)
-    rows = [make_case(base_fields, engine)] + [make_case({**base_fields, **ov}, engine) for ov in scenarios.values()]
-    P = engine.predict_proba(pd.concat(rows, ignore_index=True))
+    variants = [base_fields] + [{**base_fields, **ov} for ov in scenarios.values()]
+    P = np.vstack([predict_fields(engine, v)["headline"] for v in variants])
     out = pd.DataFrame(P, columns=[f"by_{h}d" for h in engine.horizons])
     out.insert(0, "scenario", names)
     return out
@@ -118,11 +210,15 @@ def compare(engine: SolvabilityEngine, base_fields: dict, scenarios: dict[str, d
 
 def sweep(engine: SolvabilityEngine, base_fields: dict, field: str, values: list) -> pd.DataFrame:
     field = normalise_fields({field: None}).popitem()[0]
-    rows = [make_case({**base_fields, field: v}, engine) for v in values]
-    P = engine.predict_proba(pd.concat(rows, ignore_index=True))
+    P = np.vstack([predict_fields(engine, {**base_fields, field: v})["headline"] for v in values])
     out = pd.DataFrame(P, columns=[f"by_{h}d" for h in engine.horizons])
     out.insert(0, field, values)
     return out
+
+
+def mean_curve(engine: SolvabilityEngine, fields: dict, t) -> np.ndarray:
+    pop = population(engine, fields)
+    return _nanmean(engine.curve(pop, t))
 
 
 def wait_analysis(engine: SolvabilityEngine, fields: dict, waited=(0, 1, 3, 7, 14, 30, 60, 90, 180),
@@ -137,21 +233,24 @@ def wait_analysis(engine: SolvabilityEngine, fields: dict, waited=(0, 1, 3, 7, 1
     case = make_case(fields, engine)
     if not engine.has_timing:
         engine.curve(case, [0])          # raises with an explanation
+    if np.isnan(predict_fields(engine, fields)["headline"]).any():
+        raise ValueError("This agency's records say whether a case cleared but not when, so there "
+                         "is no time curve for it. Leave the jurisdiction blank to use agencies "
+                         "that record clearance dates.")
     L = engine.long_run
     waited = [w for w in waited if w < L]
-    grid = sorted(set(list(waited) + [min(w + window, L) for w in waited] + [L]))
-    F = dict(zip(grid, engine.curve(case, grid)[0]))
+    fine = np.arange(0, int(L) + 1, dtype=float)
+    Ff = mean_curve(engine, fields, fine)
+    F = dict(zip(fine.astype(int), Ff))
     rows = []
     for w in waited:
         surv = 1.0 - F[w]
-        nxt = (F[min(w + window, L)] - F[w]) / surv if surv > 0 else 0.0
-        rest = (F[L] - F[w]) / surv if surv > 0 else 0.0
+        nxt = (F[int(min(w + window, L))] - F[w]) / surv if surv > 0 else 0.0
+        rest = (F[int(L)] - F[w]) / surv if surv > 0 else 0.0
         rows.append({"days_open": w, f"p_next_{window}d": nxt, f"p_by_{int(L)}d": rest})
     table = pd.DataFrame(rows)
 
-    # first day on a fine grid where the remaining long-run chance drops below the bar
-    fine = np.arange(0, int(L))
-    Ff = engine.curve(case, np.append(fine, L))[0]
+    # first day where the remaining long-run chance drops below the bar
     remaining = (Ff[-1] - Ff[:-1]) / np.clip(1 - Ff[:-1], 1e-9, None)
     below = np.nonzero(remaining < give_up_below)[0]
     return {"table": table, "window": window, "long_run": L,

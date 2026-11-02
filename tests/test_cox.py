@@ -73,3 +73,14 @@ def test_concordance_matches_brute_force(seed):
     E = rng.integers(0, 2, 120)
     R = rng.integers(0, 6, 120).astype(float)
     assert concordance_index(T, E, R) == pytest.approx(_brute_c(T, E, R))
+
+
+def test_matches_statsmodels_reference():
+    """Cross-check against an independent Cox implementation (statsmodels PHReg,
+    Breslow ties, same strata): coefficients and log-likelihood should agree."""
+    sm = pytest.importorskip("statsmodels.duration.hazard_regression")
+    X, d, e, s = _simulate(n=3000, strata=True, seed=11)
+    ours = CoxPH(penalizer=0.0, tol=1e-10).fit(X, d, e, strata=s)
+    ref = sm.PHReg(d, X, status=e, strata=s, ties="breslow").fit()
+    np.testing.assert_allclose(np.log(ours.hazard_ratios()), ref.params, atol=1e-4)
+    assert ours.loglik_ == pytest.approx(ref.llf, abs=1e-3)

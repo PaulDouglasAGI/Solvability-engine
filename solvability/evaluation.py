@@ -144,3 +144,59 @@ def calibration_plot(engine: SolvabilityEngine, result: dict, path, title: str |
     fig.tight_layout(rect=(0, 0.07, 1, 0.97))
     fig.savefig(path, dpi=150, facecolor=SURFACE)
     plt.close(fig)
+
+
+def case_plot(engine: SolvabilityEngine, case: pd.DataFrame, similar: dict | None, path,
+              title: str = "Chance this case is cleared, over time", subtitle: str | None = None) -> None:
+    """Model curve for one case beside the observed outcomes of similar real cases."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4.6), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    L = engine.long_run
+    if engine.has_timing:
+        t = np.linspace(0, L, 400)
+        with np.errstate(all="ignore"):
+            curve = np.nanmean(engine.curve(case, t), axis=0)
+        ax.plot(t, 100 * curve, color=COLORS["gbm"], linewidth=2, label="Model estimate")
+    with np.errstate(all="ignore"):
+        P = np.nanmean(engine.predict_proba(case), axis=0)
+    hs = np.array(engine.horizons, float)
+    ok = ~np.isnan(P)
+    ax.plot(hs[ok], 100 * P[ok], "o", color=COLORS["gbm"], markersize=6, markeredgecolor=SURFACE,
+            markeredgewidth=1.5, label=None if engine.has_timing else "Model estimate")
+    for h, p in zip(hs[ok], P[ok]):
+        if h >= 30 or not engine.has_timing:
+            ax.annotate(f"{100 * p:.1f}%", (h, 100 * p), textcoords="offset points", xytext=(0, 8),
+                        ha="center", fontsize=8, color=INK)
+    if similar and similar.get("n"):
+        cur = similar.get("observed_curve")
+        if cur is not None:
+            d = np.array(cur["days"])
+            f, lo, hi = (np.array(cur[k], dtype=float) for k in ("p", "lo", "hi"))
+            ax.fill_between(d, 100 * lo, 100 * hi, step="post", color=COLORS["cox"], alpha=0.15,
+                            linewidth=0, label="95% range for those cases")
+            ax.step(d, 100 * f, where="post", color=COLORS["cox"], linewidth=2,
+                    label=f"What happened to {similar['n_with_dates']:,} similar real cases")
+        elif similar.get("observed_long_run") is not None:
+            ax.plot([L], [100 * similar["observed_long_run"]], "s", color=COLORS["cox"], markersize=7,
+                    label=f"Observed in {similar['n']:,} similar real cases")
+    ax.set_xlim(0, L * 1.02)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Days since the theft", color=INK2, fontsize=9)
+    ax.set_ylabel("% cleared", color=INK2, fontsize=9)
+    ax.tick_params(colors=INK2, labelsize=8)
+    ax.grid(color=GRID, linewidth=0.8)
+    for s in ax.spines.values():
+        s.set_color(GRID)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", labelcolor=INK)
+    sup = title + ("  [SYNTHETIC DATA]" if engine.is_synthetic else "")
+    ax.set_title(sup + (f"\n{subtitle}" if subtitle else ""), color=INK, fontsize=11, loc="left")
+    src = ", ".join(engine.meta.get("sources", []))
+    fig.text(0.01, 0.01, f"Source: {src}. Reported thefts only; 'cleared' = arrest or exceptional "
+             "clearance as recorded by each agency.", fontsize=7, color=INK2)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
