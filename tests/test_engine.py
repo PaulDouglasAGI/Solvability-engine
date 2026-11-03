@@ -167,3 +167,30 @@ def test_ask_only_asks_learned_questions(tmp_path, capsys):
     assert "licence plate" not in " ".join(prompts).lower()
     assert "Not asked" in out and "Similar real cases" in out
     assert (tmp_path / "case.png").exists()
+
+
+def test_county_filter(engine):
+    # "Gamma" appears only inside the multi-county label "Beta, Gamma"
+    pop = wi.population(engine, {"county": "gamma", "item": "vehicle"})
+    assert set(pop["jurisdiction"]) <= {"metro_b", "county_c"}
+    case = wi.make_case({"item": "vehicle"}, engine)
+    sim = engine.similar(case, {"item_category"}, county="Gamma")
+    assert sim["criteria"][0] == "county = Gamma" and set(sim["agencies"]) <= {"metro_b", "county_c"}
+    assert engine.counties() == ["Alpha", "Beta", "Gamma"]
+    with pytest.raises(wi.CaseInputError):
+        wi.population(engine, {"county": "Atlantis"})
+
+
+def test_mixed_timed_and_untimed_agencies():
+    """Real setup: NIBRS agencies have clearance dates, the LA portal doesn't."""
+    d = clean(generate(6000, seed=4))
+    m = d.jurisdiction == "town_d"
+    d.loc[m, "timing_known"] = False
+    d.loc[m & (d.cleared == 1), "duration_days"] = np.nan
+    tr, ca, te = split(d, seed=0)
+    e = SolvabilityEngine().fit(tr, ca)
+    P = e.predict_proba(te)
+    untimed = (te.jurisdiction == "town_d").to_numpy()
+    assert e.untimed_jurisdictions_ == {"town_d"}
+    assert np.isnan(P[untimed][:, :-1]).all() and not np.isnan(P[untimed][:, -1]).any()
+    assert not np.isnan(P[~untimed]).any()

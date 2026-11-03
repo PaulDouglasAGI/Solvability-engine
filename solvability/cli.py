@@ -221,7 +221,8 @@ def _prediction_payload(engine, fields, horizon=None, top=5):
         "factor_horizon_days": horizon,
         "top_factors": wi.explain_fields(engine, fields, horizon=horizon, top=top),
         "warnings": wi.check_case(engine, case, fields),
-        "similar_real_cases": engine.similar(case, fields.keys()),
+        "similar_real_cases": engine.similar(case, [k for k in fields if k != "county"],
+                                             county=fields.get("county")),
         "synthetic_model": engine.is_synthetic,
         "caveats": engine.caveats(),
     }
@@ -232,10 +233,13 @@ def _case_phrase(k, v):
         return f"${v:,.0f}"
     if k == "days_to_report":
         return f"reported after {v:g} days"
+    if k == "county":
+        return f"{v} County"
     if k == "jurisdiction":
         parts = str(v).split(" ", 1)
         if len(parts) == 2 and len(parts[0]) == 2:
-            return f"{parts[1].title()} ({parts[0].upper()})"
+            name = parts[1].title().replace("Dupage", "DuPage")
+            return f"{name} ({parts[0].upper()})"
         return str(v).replace("_", " ").title()
     if k in ("has_footage", "has_witness", "has_plate_read", "insider"):
         return f"{wi.FIELD_LABELS[k]}: {wi._show(k, v)}"
@@ -267,6 +271,12 @@ def _render_prediction(engine, fields, pay, plot=None):
         yrs = f"{sim['years'][0]}–{sim['years'][1]}" if sim["years"] else ""
         print(_wrap(f"Similar real cases: {sim['n']:,} reported thefts ({src}; {yrs}) matching "
                     + ("; ".join(sim["criteria"]) or "nothing specific (all cases)") + "."))
+        if fields.get("county") and sim.get("agencies"):
+            ag = list(sim["agencies"].items())
+            shown = ", ".join(f"{_case_phrase('jurisdiction', k)} {v:,}" for k, v in ag[:8])
+            more = f" and {len(ag) - 8} more" if len(ag) > 8 else ""
+            print(_wrap(f"Agencies in that group: {shown}{more}. Agencies that straddle county "
+                        "lines (e.g. Aurora, Bolingbrook) are included whole."))
         if sim["relaxed"]:
             print(_wrap("Too few exact matches, so these were not required to match: "
                         + ", ".join(r.replace("_", " ") for r in sim["relaxed"]) + "."))
@@ -305,6 +315,7 @@ QUESTIONS = {
     "loss_value": "Roughly what was it worth, in dollars?",
     "days_to_report": "How many days after the theft was it reported? (0 = same day)",
     "victim_type": "Who was the victim?",
+    "county": "Which county? (type part of the name, e.g. DuPage)",
     "jurisdiction": "Which police agency? (type part of the name)",
     "has_footage": "Was there video footage?",
     "has_witness": "Were there witnesses?",
@@ -327,8 +338,30 @@ def _ask_one(engine, f, inp, out):
         if a.isdigit() and 1 <= int(a) <= len(levels):
             return levels[int(a) - 1]
         return None
+    if f == "county":
+        names = engine.counties()
+        a = inp(f"\n{q} Enter = skip: ").strip().lower()
+        if not a:
+            return None
+        hits = [c for c in names if a.replace(" ", "") in c.lower().replace(" ", "")]
+        if not hits:
+            print("  no county in the data matches; using all areas", file=out)
+            return None
+        if len(hits) == 1:
+            print(f"  using {hits[0]} County", file=out)
+            return hits[0]
+        for i, c in enumerate(hits[:12], 1):
+            print(f"  {i:>2}) {c}", file=out)
+        b = inp("  choose a number: ").strip()
+        return hits[int(b) - 1] if b.isdigit() and 1 <= int(b) <= len(hits[:12]) else None
     if f == "jurisdiction":
         levels = [lv for lv in engine.builder.levels_[f] if lv != "other"]
+        county = getattr(engine, "_ask_county", None)
+        if county:
+            ref = engine.reference_cases
+            from .evidence import county_mask
+            inside = set(ref.loc[county_mask(ref, county), "jurisdiction"].astype(str).unique())
+            levels = [lv for lv in levels if lv in inside]
         a = inp(f"\n{q} Enter = skip: ").strip().lower()
         if not a:
             return None
@@ -352,17 +385,20 @@ def cmd_ask(args, inp=input, out=None):
     out = out or sys.stdout
     engine = _load_engine(args.model)
     fields_ok = engine.askable_fields()
-    skipped = [QUESTIONS[f] for f in QUESTIONS if f not in fields_ok]
+    skipped = [QUESTIONS[f] for f in QUESTIONS if f not in fields_ok and f != "county"]
     print("Answer a few questions about a reported theft. Every question is about something "
           "the real data records, so the answer is based on actual cases.", file=out)
     if skipped:
         print(_wrap("Not asked, because the training data doesn't record it: "
                     + "; ".join(s.split("?")[0].lower() for s in skipped) + "."), file=out)
     fields = {}
-    for f in fields_ok:
+    order = (["county"] if engine.counties() else []) + fields_ok
+    for f in order:
         v = _ask_one(engine, f, inp, out)
         if v is not None:
             fields[f] = v
+            if f == "county":
+                engine._ask_county = v
     print("", file=out)
     pay = _prediction_payload(engine, fields, None, args.top)
     _render_prediction(engine, fields, pay, args.plot)
@@ -442,7 +478,7 @@ def cmd_info(args):
     e = _load_engine(args.model)
     print(json.dumps(e.meta, indent=2, default=str))
     if e.cox is not None:
-        hr = pd.Series(e.cox.hazard_ratios(), index=e.builder.columns_)
+        hr = pd.Series(e.cox.hazard_ratios(), index=e.cox_columns)
         print("\nCox hazard ratios per unit (largest effects; >1 = clears sooner):")
         order = np.argsort(-np.abs(np.log(hr.values)))[: args.top]
         for i in order:

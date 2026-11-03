@@ -17,8 +17,8 @@ CATS = ["item_category", "location_type", "victim_type", "jurisdiction"]
 
 @dataclass
 class FeatureBuilder:
-    min_jurisdiction_count: int = 300
-    max_jurisdictions: int = 60
+    min_jurisdiction_count: int = 200
+    max_jurisdictions: int = 600
 
     medians_: dict = field(default_factory=dict)
     levels_: dict = field(default_factory=dict)
@@ -75,10 +75,13 @@ class FeatureBuilder:
                 cols[f"{c}__missing"] = miss.astype(float)
                 groups[f"{c}__missing"] = c
         for c in CATS:
+            if c == "jurisdiction":
+                # Agencies enter the models elsewhere: as Cox strata (own baseline
+                # hazard) and as smoothed agency clearance rates for gradient boosting.
+                # Hundreds of one-hot columns would not fit in memory at 1.7M rows.
+                continue
             s = df[c].astype(str).to_numpy()
             levels = self.levels_[c]
-            if c == "jurisdiction":
-                s = np.where(np.isin(s, levels), s, "other")
             for lv in levels:
                 name = f"{c}={lv}"
                 cols[name] = (s == lv).astype(float)
@@ -95,7 +98,7 @@ class FeatureBuilder:
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         X = self._transform(df)
-        return X.reindex(columns=self.columns_, fill_value=0.0).to_numpy(dtype=float)
+        return X.reindex(columns=self.columns_, fill_value=0.0).to_numpy(dtype=np.float32)
 
     def collapse_jurisdiction(self, s: pd.Series) -> np.ndarray:
         """Jurisdictions too small to model separately are pooled as 'other'."""

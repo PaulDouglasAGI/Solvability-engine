@@ -4,17 +4,16 @@ A retrospective analyzer for **reported property-theft cases**. It estimates the
 probability that a case is **cleared** within 1, 7, 30, 90 and 365 days, shows what
 actually happened to similar real cases, and lists which answers moved the estimate.
 
-**The data is real.** The model is trained on **1.38 million reported thefts**:
-1.27M FBI NIBRS incidents from Colorado, Virginia, Michigan, Washington and Vermont
-(2022–2024), plus Chicago (2023) and Los Angeles (2022) open-data records. A synthetic
+**The data is real.** The model is trained on **1.71 million reported thefts**: FBI
+NIBRS incidents from Illinois (including Chicago and all 39 DuPage County agencies),
+Colorado, Virginia, Michigan, Washington and Vermont (2022–2024), plus Los Angeles
+(2022) open-data records. A synthetic
 generator exists only for tests and demos, and anything trained on it is labelled
 SYNTHETIC.
 
 ```
 $ solvability ask --model artifacts/real.pkl --plot case.png
 What was stolen?
-   1) vehicle                      182,205 real cases
-   2) retail merchandise           178,977 real cases
    ...
 Case: item_category=bicycle, location_type=street_parking, loss_value=900.0,
       victim_type=individual, jurisdiction=co denver
@@ -22,16 +21,17 @@ Case: item_category=bicycle, location_type=street_parking, loss_value=900.0,
 P(case cleared within ...)
               model   similar real cases
      1 days    0.9%                 0.0%
-    30 days    1.6%                 0.2%
-    90 days    1.9%                 0.5%
+    30 days    1.8%                 0.2%
+    90 days    2.2%                 0.5%
    365 days    3.4%                 0.7%
   Similar real cases: 442 reported thefts (nibrs 442; 2023–2024) matching item category
     = bicycle; location type = street parking; victim type = individual; jurisdiction =
     co denver; value $450–$1,800.
 
 What moves the estimate at 90 days (each answer vs. not knowing it):
-    -2.1 pts  jurisdiction: co denver
-    -1.8 pts  item category: bicycle
+    -3.6 pts  item category: bicycle
+    -1.6 pts  jurisdiction: co denver
+    -0.6 pts  location type: street_parking
 Caveats
   - Only REPORTED thefts are in the data. ...
   - 'Cleared' means different things in different places. ...
@@ -44,8 +44,8 @@ Caveats
 ```bash
 pip install -e '.[dev]'
 
-# Build the real-data model: downloads FBI NIBRS + Chicago + LA, then trains
-# (~10 min, ~2 GB disk). Set STATES="TX OH" etc. to choose states.
+# Build the real-data model: downloads FBI NIBRS (IL CO VA MI WA VT) + LA, then
+# trains (~15 min, ~3 GB disk). Set STATES="TX OH" etc. to choose states.
 scripts/build_real_model.sh
 
 # Ask about a theft (interactive). --plot saves a slide-ready chart.
@@ -60,10 +60,44 @@ Individual steps:
 solvability fetch nibrs --state CO VA --years 2023 2024 --out data/raw/nibrs    # FBI Crime Data Explorer
 solvability fetch chicago --since 2023-01-01 --until 2024-01-01 --out data/raw/chicago.csv
 solvability fetch la      --since 2022-01-01 --until 2023-01-01 --out data/raw/la.csv
-solvability train --data nibrs=data/raw/nibrs --data chicago=data/raw/chicago.csv \
-                  --data la=data/raw/la.csv --out artifacts/real.pkl
+solvability train --data nibrs=data/raw/nibrs --data la=data/raw/la.csv --out artifacts/real.pkl
+# (Chicago is in Illinois NIBRS, with clearance dates; the Chicago portal loader is
+#  still available for portal-only analyses, but don't combine the two: double counting)
 solvability synth --out data/synth.csv     # synthetic demo data, tests only
 ```
+
+## DuPage County (or any county)
+
+Illinois reports to NIBRS, so every DuPage police agency is in the data with
+clearance dates: about 21,000 thefts in 2023–2024 across 38 agencies (Naperville,
+Wheaton, Lombard, Downers Grove, Elmhurst, the Sheriff, ...). `county=` narrows the
+real cases used for unanswered questions and for the "similar real cases" comparison.
+`ask` starts with the county question.
+
+```bash
+solvability predict --model artifacts/real.pkl --set county=DuPage item=bicycle location=residence value=600 --plot dupage.png
+solvability whatif  --model artifacts/real.pkl --set county=DuPage item=electronics value=1200 location=residence \
+   --scenario "Naperville PD: agency=il naperville" --scenario "Lombard PD: agency=il lombard"
+```
+
+![DuPage example](docs/example_dupage.png)
+
+Accuracy on **held-out DuPage cases** (4,378 the model never saw):
+
+| cleared within | observed | predicted | AUC |
+|---|---|---|---|
+| 1 day | 13.2% | 13.8% | 0.85 |
+| 30 days | 15.7% | 16.7% | 0.84 |
+| 90 days | 16.5% | 17.9% | 0.84 |
+| 365 days | 18.6% | 20.1% | 0.83 |
+
+Agencies (90 days, observed vs predicted): Naperville 13.6% vs 12.6%, Bolingbrook
+14.5% vs 14.5%, St. Charles 26.8% vs 27.4%, Elmhurst 31.2% vs 29.5%, Lombard 35.4%
+vs 38.8%, Oak Brook 45.6% vs 49.5%. The model runs about 1–1.5 points high for
+DuPage overall. DuPage's training-period rate (17.2% at 90 days) falls between the
+held-out rate and the prediction, so part of the gap is sampling.
+Agencies that straddle county lines (Aurora, Bolingbrook, St. Charles) are counted
+whole. Their records don't say which side of the line a theft happened on.
 
 ## Which inputs the real data supports
 
@@ -79,6 +113,7 @@ The engine only asks about, and only learns from, what the source records hold.
 | days to report | no | no | yes |
 | similar recent thefts nearby | derived | derived | derived |
 | agency (jurisdiction) | yes | Chicago PD | LAPD |
+| county | yes (from FBI agency list) | Cook | Los Angeles |
 | insider (employee/employer) | sparse | no | embezzlement only |
 | footage / witnesses / plate reads | **no** | **no** | **no** |
 
@@ -183,8 +218,14 @@ horizons would silently turn late clearances into "not cleared". A model trained
 on such sources answers the 365-day question and says so. In a mixed model, Chicago
 and LA get only a 365-day estimate, and the other agencies get the full curve.
 
-**Jurisdiction.** The Cox baseline hazard is stratified by jurisdiction, because each
-department records "cleared" its own way. Evaluation prints observed vs. predicted
+**Jurisdiction.** Every agency with 200+ thefts gets its own Cox baseline hazard
+(stratum), because each department records "cleared" its own way. Gradient boosting
+gets each agency's Cox baseline at 7/90/365 days as inputs. That describes how the
+agency itself clears cases *with case mix held fixed*, so a mall-heavy suburb's
+shoplifting isn't counted twice. Smaller agencies are pooled. A final local
+recalibration uses held-out calibration cases to shrink each agency's
+observed/expected ratio toward 1 and apply it. Small agencies are grouped by
+county for this step. Evaluation prints observed vs. predicted
 clearance by jurisdiction, so you can see where a pooled model fits poorly.
 
 **Calibration.** Each model is calibrated separately at each horizon on a held-out
@@ -217,26 +258,25 @@ observed. Inputs outside the training range are flagged as extrapolation.
 
 ## Results on real data
 
-Held-out test set of 275,400 real reported thefts that the model never saw (random
+Held-out test set of 342,410 real reported thefts that the model never saw (random
 20% split). Calibration error (ECE) is the average gap between predicted and observed
 clearance rates.
 
 | cleared within | cases | observed | predicted | AUC | ECE |
 |---|---|---|---|---|---|
-| 1 day | 254,425 | 9.8% | 9.8% | 0.89 | 0.001 |
-| 7 days | 254,425 | 11.0% | 11.1% | 0.88 | 0.002 |
-| 30 days | 254,425 | 12.6% | 12.7% | 0.88 | 0.002 |
-| 90 days | 251,366 | 13.8% | 14.0% | 0.88 | 0.002 |
-| 365 days | 80,955 | 12.0% | 12.5% | 0.88 | 0.006 |
+| 1 day | 332,620 | 9.4% | 9.3% | 0.90 | 0.002 |
+| 7 days | 332,620 | 10.4% | 10.6% | 0.90 | 0.002 |
+| 30 days | 332,620 | 11.8% | 12.0% | 0.89 | 0.002 |
+| 90 days | 329,551 | 12.9% | 13.2% | 0.89 | 0.002 |
+| 365 days | 88,592 | 12.7% | 13.2% | 0.89 | 0.005 |
 
-(The 365-day row includes Chicago and LA, which clear 4–6% of thefts, and only NIBRS
-cases from January–March, the only ones followed for a full year. On NIBRS alone, 13.5%
-are cleared by 90 days and 14.7% by 365.)
+(The 365-day row covers only NIBRS cases from January–March, the only ones followed for
+a full year, plus LA, which clears about 6% of thefts.)
 
-- Time-to-clearance concordance: 0.86 headline, 0.82 Cox alone.
-- **Calibrated within subgroups**: per agency (e.g. Fairfax County VA 29.6% observed
-  vs 30.8% predicted at 365 days; Chicago 4.4% vs 4.5%; Seattle 3.7% vs 4.0%), per item
-  type (bicycles 5.0% vs 5.1% at 90 days), and in every decile of predicted risk.
+- Time-to-clearance concordance: 0.88 headline, 0.82 Cox alone.
+- **Calibrated within agencies** (365 days, observed vs predicted): Chicago 4.4% vs
+  4.8%, LA 5.7% vs 5.5%, Denver 8.2% vs 8.7%, Seattle 3.7% vs 4.0%, Fairfax County VA
+  29.7% vs 30.5%. For DuPage, see above.
 - The gradient-boosting model beat Cox and the blend on held-out calibration data at
   every horizon, so it supplies the headline. Cox is still reported, drives the curve
   shape between horizons, and gives hazard ratios (`solvability info`).

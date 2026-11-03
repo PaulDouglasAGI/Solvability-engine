@@ -110,6 +110,10 @@ class SolvabilityEngine:
     reference_cases: pd.DataFrame | None = None
     headline_choice_: dict = field(default_factory=dict)
     untimed_jurisdictions_: set = field(default_factory=set)
+    cox_cols_: np.ndarray | None = None      # columns the Cox model uses
+    agency_rates_: dict = field(default_factory=dict)   # horizon -> (rates by agency, overall)
+    local_adjust_: dict = field(default_factory=dict)   # agency (or small agencies by county) -> odds ratio
+    LOCAL_PRIOR = 200                                   # pseudo-cases pulling the ratio to 1
 
     @property
     def long_run(self) -> float:
@@ -130,12 +134,18 @@ class SolvabilityEngine:
         # Cox on rows whose clearance timing is known
         if tk.sum() and train.loc[tk, "cleared"].sum() >= MIN_COX_EVENTS:
             strata = self.builder.collapse_jurisdiction(train.loc[tk, "jurisdiction"]) if self.stratify_cox else None
+            # With strata, each agency has its own baseline hazard, so agency indicator
+            # columns would be redundant (and make the fit slow with hundreds of agencies).
+            groups = self.builder.column_groups()
+            self.cox_cols_ = (groups != "jurisdiction") if self.stratify_cox else np.ones(len(groups), bool)
             self.cox = CoxPH(penalizer=self.cox_penalizer).fit(
-                Xtr[tk], train.loc[tk, "duration_days"].to_numpy(), train.loc[tk, "cleared"].to_numpy(), strata)
+                Xtr[tk][:, self.cox_cols_], train.loc[tk, "duration_days"].to_numpy(), train.loc[tk, "cleared"].to_numpy(), strata)
         else:
             self.cox = None
             warnings.warn("Not enough clearance dates to fit the Cox model. Only "
                           "per-horizon models will be used.")
+
+        Gtr = np.hstack([Xtr, self._fit_agency_rates(train)])
 
         # One gradient-boosting classifier per horizon, trained on rows we can label
         self.gbms = {}
@@ -148,12 +158,12 @@ class SolvabilityEngine:
                 learning_rate=0.05, max_iter=400, max_leaf_nodes=31, min_samples_leaf=40,
                 l2_regularization=1.0, early_stopping=True, validation_fraction=0.15,
                 n_iter_no_change=25, random_state=self.random_state)
-            clf.fit(Xtr[m], y[m].to_numpy())
+            clf.fit(Gtr[m], y[m].to_numpy())
             self.gbms[h] = clf
 
         # Calibrate both on held-out rows
         raw_cox = self._raw_cox(Xca, calib) if self.cox is not None else None
-        raw_gbm = self._raw_gbm(Xca)
+        raw_gbm = self._raw_gbm(Xca, calib)
         self.cal_cox, self.cal_gbm = {}, {}
         for j, h in enumerate(self.horizons):
             y = horizon_labels(calib, h, self.long_run)
@@ -181,6 +191,8 @@ class SolvabilityEngine:
                         scores[name] = float(np.mean((p[ok] - y[ok]) ** 2))
                 self.headline_choice_[h] = min(scores, key=scores.get) if scores else "gbm"
 
+        self._fit_local_adjust(calib)
+
         self.reference_cases = compact_reference(pd.concat([train, calib], ignore_index=True))
         self.meta = {
             "n_train": int(len(train)), "n_calib": int(len(calib)),
@@ -192,6 +204,7 @@ class SolvabilityEngine:
             "gbm_horizons": sorted(self.gbms),
             "cox_fitted": self.cox is not None,
             "headline_by_horizon": dict(self.headline_choice_),
+            "local_adjustments": len(self.local_adjust_),
             "jurisdictions_without_clearance_dates": sorted(self.untimed_jurisdictions_),
             "calibration": {"cox": {h: c.method for h, c in self.cal_cox.items()},
                             "gbm": {h: c.method for h, c in self.cal_gbm.items()}},
@@ -199,6 +212,18 @@ class SolvabilityEngine:
         return self
 
     # ---------------------------------------------------------- raw scores
+    def _cox_mask(self) -> np.ndarray:
+        if self.cox_cols_ is None:
+            return np.ones(len(self.builder.columns_), bool)
+        return self.cox_cols_
+
+    def _cox_X(self, X):
+        return np.asarray(X)[:, self._cox_mask()]
+
+    @property
+    def cox_columns(self) -> list[str]:
+        return [c for c, keep in zip(self.builder.columns_, self._cox_mask()) if keep]
+
     def _strata(self, df):
         if self.cox is None or not self.stratify_cox:
             return None
@@ -206,18 +231,81 @@ class SolvabilityEngine:
 
     def _raw_cox(self, X, df) -> np.ndarray:
         strata = self._strata(df)
-        out = self.cox.predict_cdf(X, self.horizons, strata)
+        out = self.cox.predict_cdf(self._cox_X(X), self.horizons, strata)
         if self.untimed_jurisdictions_:
             # no Cox estimate for agencies whose records carry no clearance dates
             jur = self.builder.collapse_jurisdiction(df["jurisdiction"])
             out[np.isin(jur, list(self.untimed_jurisdictions_))] = np.nan
         return out
 
-    def _raw_gbm(self, X) -> np.ndarray:
+    # Agency features for gradient boosting.
+    #
+    # An agency's raw clearance rate already reflects its case mix (a mall-heavy
+    # suburb clears lots of shoplifting), so feeding that rate next to the item and
+    # location features double-counts the mix. Instead, use each agency's Cox baseline
+    # cumulative hazard: the stratified Cox model estimates it with case mix held
+    # fixed, so it captures only how the agency itself clears cases. Agencies with no
+    # clearance dates (no Cox stratum) get a smoothed, out-of-fold long-run rate.
+    AGENCY_HAZARD_HORIZONS = (7, 90)
+    AGENCY_RATE_PRIOR = 200          # pseudo-cases pulling small agencies to the mean
+
+    def _agency_hazard_cols(self, jur: np.ndarray) -> np.ndarray:
+        hs = [h for h in self.AGENCY_HAZARD_HORIZONS if h in self.horizons] + [self.long_run]
+        out = np.full((len(jur), len(hs)), np.nan, dtype=np.float32)
+        if self.cox is None or not self.stratify_cox:
+            return out[:, :0]
+        for k in np.unique(jur):
+            if k not in self.cox.baselines_:
+                continue
+            ch = self.cox._cumhaz0(k, hs)
+            out[jur == k] = np.log(np.clip(ch, 1e-6, None)).astype(np.float32)
+        return out
+
+    def _fit_agency_rates(self, train: pd.DataFrame, folds: int = 5) -> np.ndarray:
+        jur = self.builder.collapse_jurisdiction(train["jurisdiction"])
+        haz = self._agency_hazard_cols(jur)
+        # smoothed long-run rate, only for agencies the Cox model has no baseline for
+        self.agency_rates_ = {}
+        untimed = np.isin(jur, list(self.untimed_jurisdictions_))
+        rate_col = np.full((len(train), 1), np.nan, dtype=np.float32)
+        y = horizon_labels(train, self.long_run, self.long_run).to_numpy()
+        ok = ~np.isnan(y) & untimed
+        if ok.sum() >= 100:
+            fold = np.random.default_rng(self.random_state).integers(0, folds, len(train))
+            frame = pd.DataFrame({"j": jur[ok], "y": y[ok], "f": fold[ok]})
+            overall = float(frame["y"].mean())
+            tot = frame.groupby("j")["y"].agg(["sum", "count"])
+            self.agency_rates_[self.long_run] = (((tot["sum"] + self.AGENCY_RATE_PRIOR * overall)
+                                                  / (tot["count"] + self.AGENCY_RATE_PRIOR)).to_dict(), overall)
+            by_fold = frame.groupby(["f", "j"])["y"].agg(["sum", "count"])
+            for k in range(folds):
+                rest = tot.sub(by_fold.loc[k], fill_value=0) if k in by_fold.index.get_level_values(0) else tot
+                rate = (rest["sum"] + self.AGENCY_RATE_PRIOR * overall) / (rest["count"] + self.AGENCY_RATE_PRIOR)
+                m = (fold == k) & untimed
+                rate_col[m, 0] = pd.Series(jur[m]).map(rate).to_numpy()
+            rate_col[np.isnan(rate_col)] = -1.0     # "not applicable": an all-NaN column breaks binning
+            return np.hstack([haz, rate_col])
+        return haz
+
+    def _agency_rate_cols(self, df: pd.DataFrame) -> np.ndarray:
+        jur = self.builder.collapse_jurisdiction(df["jurisdiction"])
+        cols = [self._agency_hazard_cols(jur)]
+        for h, (rates, overall) in self.agency_rates_.items():
+            untimed = np.isin(jur, list(self.untimed_jurisdictions_))
+            v = pd.Series(jur).map(rates).to_numpy(dtype=np.float32)
+            v[~untimed] = np.nan
+            v[np.isnan(v)] = -1.0
+            cols.append(v[:, None])
+        return np.hstack(cols)
+
+    def _raw_gbm(self, X, df) -> np.ndarray:
         out = np.full((X.shape[0], len(self.horizons)), np.nan)
+        if not self.gbms:
+            return out
+        G = np.hstack([X, self._agency_rate_cols(df)])
         for j, h in enumerate(self.horizons):
             if h in self.gbms:
-                out[:, j] = self.gbms[h].predict_proba(X)[:, 1]
+                out[:, j] = self.gbms[h].predict_proba(G)[:, 1]
         return out
 
     # ----------------------------------------------------------- predict
@@ -232,7 +320,7 @@ class SolvabilityEngine:
                                   for j, h in enumerate(self.horizons)])
             cc[np.isnan(rc)] = np.nan
             out["cox_raw"], out["cox"] = rc, _monotone(cc)
-        rg = self._raw_gbm(X)
+        rg = self._raw_gbm(X, df)
         cg = np.column_stack([self.cal_gbm[h].transform(rg[:, j]) if h in self.cal_gbm else rg[:, j]
                               for j, h in enumerate(self.horizons)])
         out["gbm_raw"] = rg
@@ -265,6 +353,47 @@ class SolvabilityEngine:
             out["headline"] = np.where(np.isnan(out[mode]), out["gbm"], out[mode])
         else:
             out["headline"] = out["gbm"] if not np.isnan(out["gbm"]).all() else out.get("cox", out["gbm"])
+        out["headline_unadjusted"] = out["headline"]
+        out["headline"] = _monotone(self._apply_local(out["headline"], df))
+        return out
+
+    # ------------------------------------------------------ local recalibration
+    def _local_keys(self, df: pd.DataFrame) -> np.ndarray:
+        """Agency with its own setting, else small agencies grouped by county."""
+        jur = self.builder.collapse_jurisdiction(df["jurisdiction"])
+        county = (df["county"].astype(str).to_numpy() if "county" in df
+                  else np.full(len(df), "nan", dtype=object))
+        return np.where(jur == "other", np.char.add("other:", county.astype(str)), jur)
+
+    def _fit_local_adjust(self, calib: pd.DataFrame) -> None:
+        """Observed/expected clearance per agency on calibration rows (never used for
+        fitting), shrunk toward 1 and applied on the odds scale. It fixes local bias the
+        pooled models leave, e.g. mall-heavy suburbs."""
+        self.local_adjust_ = {}
+        P = self.predict_all(calib)["headline"]
+        keys = self._local_keys(calib)
+        for h in (90, self.long_run):
+            if h not in self.horizons:
+                continue
+            j = list(self.horizons).index(h)
+            y = horizon_labels(calib, h, self.long_run).to_numpy()
+            ok = ~np.isnan(y) & ~np.isnan(P[:, j])
+            frame = pd.DataFrame({"k": keys[ok], "y": y[ok], "p": P[ok, j]})
+            for k, g in frame.groupby("k"):
+                if k in self.local_adjust_:
+                    continue                    # 90-day estimate preferred where it exists
+                pbar = g["p"].mean()
+                ratio = (g["y"].sum() + self.LOCAL_PRIOR * pbar) / (g["p"].sum() + self.LOCAL_PRIOR * pbar)
+                self.local_adjust_[k] = float(ratio)
+
+    def _apply_local(self, P: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+        if not self.local_adjust_:
+            return P
+        r = pd.Series(self._local_keys(df)).map(self.local_adjust_).fillna(1.0).to_numpy()[:, None]
+        Pc = np.clip(P, 1e-6, 1 - 1e-6)
+        odds = Pc / (1 - Pc) * r
+        out = odds / (1 + odds)
+        out[np.isnan(P)] = np.nan
         return out
 
     @property
@@ -299,8 +428,8 @@ class SolvabilityEngine:
         Fk = np.column_stack([np.zeros(len(P)), P])
         if self.cox is not None:
             X = self.builder.transform(df)
-            C_t = self.cox.predict_cdf(X, t, self._strata(df))
-            C_k = self.cox.predict_cdf(X, knots, self._strata(df))
+            C_t = self.cox.predict_cdf(self._cox_X(X), t, self._strata(df))
+            C_k = self.cox.predict_cdf(self._cox_X(X), knots, self._strata(df))
         out = np.empty((len(P), len(t)))
         j = np.clip(np.searchsorted(knots, t, side="right") - 1, 0, len(knots) - 2)
         a, b = knots[j], knots[j + 1]
@@ -329,8 +458,8 @@ class SolvabilityEngine:
 
         cox_by_field = {}
         if self.cox is not None:
-            contrib = self.cox.contributions(self.builder.transform(case))[0]
-            groups = self.builder.column_groups()
+            contrib = self.cox.contributions(self._cox_X(self.builder.transform(case)))[0]
+            groups = self.builder.column_groups()[self._cox_mask()]
             for f in set(groups):
                 cox_by_field[f] = float(np.exp(contrib[groups == f].sum()))
 
@@ -363,11 +492,21 @@ class SolvabilityEngine:
         return 90 if 90 in av else av[-1]
 
     # ----------------------------------------------------------- evidence
-    def similar(self, case: pd.DataFrame, asked_fields) -> dict | None:
+    def similar(self, case: pd.DataFrame, asked_fields, county=None) -> dict | None:
         """Outcomes of real training cases that match the answers given."""
         if self.reference_cases is None:
             return None
-        return similar_cases(self.reference_cases, case, set(asked_fields), self.horizons, self.long_run)
+        return similar_cases(self.reference_cases, case, set(asked_fields), self.horizons,
+                             self.long_run, county=county)
+
+    def counties(self) -> list[str]:
+        """Individual county names present in the reference data."""
+        if self.reference_cases is None or "county" not in self.reference_cases:
+            return []
+        names = set()
+        for c in self.reference_cases["county"].astype("category").cat.categories:
+            names.update(x.strip() for x in str(c).split(",") if x.strip() and x.strip() != "Nan")
+        return sorted(names)
 
     def askable_fields(self) -> list[str]:
         """Inputs the training data actually recorded, so the model can use them."""

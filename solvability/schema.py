@@ -9,7 +9,7 @@ from __future__ import annotations
 # Canonical columns
 # --------------------------------------------------------------------------- #
 # Identity / bookkeeping
-ID_COLS = ["case_id", "source", "jurisdiction", "area"]
+ID_COLS = ["case_id", "source", "jurisdiction", "area", "county"]
 
 # Facts about the reported case (model inputs, before featurisation)
 NUMERIC_FIELDS = ["loss_value", "days_to_report", "pattern_count", "offender_count"]
@@ -17,6 +17,9 @@ CATEGORICAL_FIELDS = ["item_category", "location_type", "victim_type", "jurisdic
 # Tri-state flags: 1 = yes, 0 = no, NaN = not recorded
 FLAG_FIELDS = ["has_footage", "has_witness", "has_plate_read", "insider"]
 INPUT_FIELDS = NUMERIC_FIELDS + CATEGORICAL_FIELDS + FLAG_FIELDS
+# Not a model input: narrows which real cases stand in for unanswered questions and
+# which cases count as "similar" (e.g. county=DuPage).
+FILTER_FIELDS = ["county"]
 
 # Outcome columns
 #   incident_date  : when the theft happened (or was reported, if occurrence unknown)

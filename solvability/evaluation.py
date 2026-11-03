@@ -69,7 +69,7 @@ def evaluate(engine: SolvabilityEngine, test: pd.DataFrame) -> dict:
     if engine.cox is not None and tk.sum() > 10:
         X = engine.builder.transform(test[tk])
         out["c_index_cox"] = concordance_index(
-            test.loc[tk, "duration_days"], test.loc[tk, "cleared"], engine.cox.log_partial_hazard(X))
+            test.loc[tk, "duration_days"], test.loc[tk, "cleared"], engine.cox.log_partial_hazard(engine._cox_X(X)))
         lr_j = len(engine.horizons) - 1
         out["c_index_headline"] = concordance_index(
             test.loc[tk, "duration_days"], test.loc[tk, "cleared"], preds["headline"][tk, lr_j])
@@ -191,7 +191,9 @@ def case_plot(engine: SolvabilityEngine, case: pd.DataFrame, similar: dict | Non
     ax.grid(color=GRID, linewidth=0.8)
     for s in ax.spines.values():
         s.set_color(GRID)
-    ax.legend(frameon=False, fontsize=8, loc="upper left", labelcolor=INK)
+    leg = ax.legend(frameon=True, fontsize=8, loc="upper left", labelcolor=INK, framealpha=0.92)
+    leg.get_frame().set_facecolor(SURFACE)
+    leg.get_frame().set_edgecolor(GRID)
     sup = title + ("  [SYNTHETIC DATA]" if engine.is_synthetic else "")
     ax.set_title(sup + (f"\n{subtitle}" if subtitle else ""), color=INK, fontsize=11, loc="left")
     src = ", ".join(engine.meta.get("sources", []))

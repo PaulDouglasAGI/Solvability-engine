@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-REF_COLS = ["source", "jurisdiction", "item_category", "location_type", "victim_type",
+REF_COLS = ["source", "jurisdiction", "county", "item_category", "location_type", "victim_type",
             "loss_value", "days_to_report", "pattern_count", "offender_count", "insider", "has_footage", "has_witness",
             "has_plate_read", "incident_date", "cleared", "duration_days", "followup_days",
             "timing_known"]
@@ -23,8 +23,9 @@ MIN_MATCHES = 100
 def compact_reference(df: pd.DataFrame) -> pd.DataFrame:
     """Keep only what's needed to look up similar cases, in small dtypes."""
     ref = df[[c for c in REF_COLS if c in df.columns]].copy()
-    for c in ["source", "jurisdiction", "item_category", "location_type", "victim_type"]:
-        ref[c] = ref[c].astype("category")
+    for c in ["source", "jurisdiction", "county", "item_category", "location_type", "victim_type"]:
+        if c in ref:
+            ref[c] = ref[c].astype("category")
     for c in ["loss_value", "days_to_report", "pattern_count", "offender_count", "insider", "has_footage", "has_witness",
               "has_plate_read", "duration_days", "followup_days"]:
         ref[c] = ref[c].astype("float32")
@@ -71,6 +72,16 @@ def kaplan_meier(durations, events, times, return_ci: bool = False):
     return F, lo, hi
 
 
+def county_mask(ref: pd.DataFrame, county) -> np.ndarray:
+    """Cases from agencies whose county list includes `county` (case-insensitive)."""
+    if not county or "county" not in ref:
+        return np.ones(len(ref), bool)
+    want = str(county).strip().lower().replace(" ", "").replace("county", "")
+    cats = ref["county"].astype("category").cat.categories
+    hit = {c for c in cats if want in str(c).lower().replace(" ", "")}
+    return ref["county"].isin(hit).to_numpy()
+
+
 def _criteria(case: pd.Series, asked: set[str]) -> dict:
     crit = {}
     for c in ["item_category", "location_type", "victim_type", "jurisdiction"]:
@@ -110,8 +121,10 @@ def describe_criteria(crit: dict) -> list[str]:
 
 
 def similar_cases(ref: pd.DataFrame, case: pd.DataFrame, asked_fields: set[str], horizons,
-                  long_run: float, min_matches: int = MIN_MATCHES) -> dict:
+                  long_run: float, min_matches: int = MIN_MATCHES, county=None) -> dict:
     row = case.iloc[0]
+    if county:
+        ref = ref[county_mask(ref, county)]
     crit = _criteria(row, asked_fields)
     dropped = []
     m = _mask(ref, crit)
@@ -146,7 +159,8 @@ def similar_cases(ref: pd.DataFrame, case: pd.DataFrame, asked_fields: set[str],
     return {
         "n": int(len(sub)),
         "n_with_dates": int(tk.sum()),
-        "criteria": describe_criteria(crit),
+        "criteria": ([f"county = {county}"] if county else []) + describe_criteria(crit),
+        "agencies": sub["jurisdiction"].astype(str).value_counts().head(50).to_dict(),
         "relaxed": dropped,
         "observed_by_horizon": {int(h): (None if np.isnan(v) else float(v)) for h, v in zip(horizons, km)},
         "observed_long_run": None if np.isnan(full_rate) else full_rate,

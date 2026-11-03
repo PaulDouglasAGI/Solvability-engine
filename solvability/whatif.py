@@ -13,7 +13,8 @@ import pandas as pd
 from .cleaning import clean
 from .features import CATS, LOG_NUMERIC
 from .models.engine import FIELD_LABELS, SolvabilityEngine
-from .schema import CANONICAL_COLS, FLAG_FIELDS, INPUT_FIELDS, VOCAB
+from .evidence import county_mask
+from .schema import CANONICAL_COLS, FILTER_FIELDS, FLAG_FIELDS, INPUT_FIELDS, VOCAB
 
 ALIASES = {
     "value": "loss_value", "loss": "loss_value", "item": "item_category", "category": "item_category",
@@ -24,6 +25,7 @@ ALIASES = {
     "plate": "has_plate_read", "plate_read": "has_plate_read", "alpr": "has_plate_read",
     "insider": "insider", "pattern": "pattern_count", "similar_recent": "pattern_count",
     "offenders": "offender_count", "jurisdiction": "jurisdiction", "city": "jurisdiction",
+    "agency": "jurisdiction", "county": "county",
 }
 
 
@@ -35,10 +37,10 @@ def normalise_fields(d: dict) -> dict:
     out = {}
     for k, v in d.items():
         key = ALIASES.get(k.strip().lower(), k.strip().lower())
-        if key not in INPUT_FIELDS:
+        if key not in INPUT_FIELDS and key not in FILTER_FIELDS:
             raise CaseInputError(
                 f"unknown case field {k!r}. The engine only takes facts about a reported case: "
-                + ", ".join(sorted(INPUT_FIELDS)))
+                + ", ".join(sorted(INPUT_FIELDS + FILTER_FIELDS)))
         out[key] = v
     return out
 
@@ -127,6 +129,12 @@ def population(engine: SolvabilityEngine, fields: dict, k: int = POP_SIZE, seed:
         return make_case(f, engine)
     case = make_case(f, engine)           # cleaned / validated answers
     pool = ref
+    if f.get("county"):
+        cm = county_mask(pool, f["county"])
+        if not cm.any():
+            raise CaseInputError(f"no training cases from a county matching {f['county']!r}. "
+                                 f"Known counties include: {', '.join(engine.counties()[:25])} ...")
+        pool = pool[cm]
     juris = case.iloc[0]["jurisdiction"] if "jurisdiction" in f else None
     if engine.has_timing and (juris is None or juris not in engine.untimed_jurisdictions_):
         pool = pool[pool["timing_known"].to_numpy(bool)]   # agencies with a time curve
@@ -141,6 +149,8 @@ def population(engine: SolvabilityEngine, fields: dict, k: int = POP_SIZE, seed:
         if isinstance(sample[c].dtype, pd.CategoricalDtype):
             sample[c] = sample[c].astype(object)
     for c in f:
+        if c in FILTER_FIELDS:
+            continue
         sample[c] = case.iloc[0][c]
     for c in FLAG_FIELDS:                 # flags the model never learned stay out entirely
         if not engine.builder.flag_observed_.get(c, False):
@@ -178,7 +188,7 @@ def explain_fields(engine: SolvabilityEngine, fields: dict, horizon=None, top: i
     base = predict_fields(engine, f)["headline"][j]
     rows = []
     for k, v in f.items():
-        if v is None:
+        if v is None or k in FILTER_FIELDS:
             continue
         without = {kk: vv for kk, vv in f.items() if kk != k}
         p = predict_fields(engine, without)["headline"][j]
